@@ -390,5 +390,15 @@ mod tests {
         let fill_frames = test_pcm.fill_channel_f32(0, 4, &mut out_buf[0..4]);
         assert_eq!(fill_frames, Ok(0));
         assert_eq!(&out_buf[0..4], &[0.0, 0.0, 0.0, 0.0]);
+
+        out_buf = [10.0; 8];
+        let fill_frames = test_pcm.fill_channel_f32(0, 1, &mut out_buf[0..2]);
+        assert_eq!(fill_frames, Ok(2));
+        assert_eq!(&out_buf[0..2], &[2.0, 3.0]);
+
+        out_buf = [10.0; 8];
+        let fill_frames = test_pcm.fill_channel_f32(0, 1, &mut out_buf[0..4]);
+        assert_eq!(fill_frames, Ok(3));
+        assert_eq!(&out_buf[0..4], &[2.0, 3.0, 4.0, 0.0]);
     }
 }
