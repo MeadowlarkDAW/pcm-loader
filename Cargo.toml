@@ -1,6 +1,6 @@
 [package]
 name = "symphonium"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MPL-2.0"
 readme = "README.md"
@@ -15,7 +15,7 @@ exclude = ["test_files/"]
 all-features = true
 
 [features]
-default = ["wav", "pcm", "ogg", "vorbis", "fft-resampler"]
+default = ["wav", "pcm", "ogg", "vorbis", "fft-resampler", "opt-simd"]
 
 # Enable specific codecs and formats.
 aac = ["symphonia/aac"]
