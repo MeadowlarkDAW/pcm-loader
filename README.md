@@ -59,7 +59,7 @@ println!("num frames: {}" audio_data_f32.data[0].len());
 
 By default, only `wav` and `ogg` support is enabled. If you need more formats, enable them as features in your `Cargo.toml` file like this:
 
-`symphonium = { version = "0.1", features = ["mp3", "flac"] }`
+`symphonium = { version = "0.2", features = ["mp3", "flac"] }`
 
 Available codecs:
 
