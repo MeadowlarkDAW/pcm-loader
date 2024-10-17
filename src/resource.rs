@@ -30,8 +30,10 @@ impl DecodedAudioF32 {
     pub fn frames(&self) -> usize {
         self.data[0].len()
     }
+}
 
-    pub fn into_decoded_audio(self) -> DecodedAudio {
+impl Into<DecodedAudio> for DecodedAudioF32 {
+    fn into(self) -> DecodedAudio {
         let channels = self.channels();
         let frames = self.frames();
 

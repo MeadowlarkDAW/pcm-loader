@@ -8,9 +8,6 @@ use symphonia::core::sample::{i24, u24};
 
 use crate::DecodedAudioF32;
 
-#[cfg(feature = "resampler")]
-use crate::ResamplerRefMut;
-
 use super::resource::{DecodedAudio, DecodedAudioType};
 use super::{convert, LoadError};
 
@@ -23,10 +20,12 @@ pub(crate) fn decode_resampled(
     pcm_sample_rate: u32,
     target_sample_rate: u32,
     n_channels: usize,
-    mut resampler: ResamplerRefMut,
+    mut resampler: crate::ResamplerRefMut,
     max_bytes: usize,
 ) -> Result<DecodedAudioF32, LoadError> {
     assert_ne!(n_channels, 0);
+
+    resampler.reset();
 
     // Get the default track in the audio stream.
     let track = probed
@@ -70,12 +69,6 @@ pub(crate) fn decode_resampled(
     let mut total_in_frames: usize = 0;
 
     let track_id = track.id;
-
-    let decode_warning = |err: &str| {
-        // Decode errors are not fatal. Print the error message and try to decode the next
-        // packet as usual.
-        log::warn!("Symphonia decode warning: {}", err);
-    };
 
     let mut desired_tmp_in_frames = resampler.input_frames_next();
     let mut delay_frames_left = resampler.output_delay();
@@ -270,12 +263,6 @@ pub(crate) fn decode_f32(
 
     let track_id = track.id;
 
-    let decode_warning = |err: &str| {
-        // Decode errors are not fatal. Print the error message and try to decode the next
-        // packet as usual.
-        log::warn!("Symphonia decode warning: {}", err);
-    };
-
     while let Ok(packet) = probed.format.next_packet() {
         // If the packet does not belong to the selected track, skip over it.
         if packet.track_id() != track_id {
@@ -333,6 +320,8 @@ pub(crate) fn decode_native_bitdepth(
     sample_rate: u32,
     max_bytes: usize,
 ) -> Result<DecodedAudio, LoadError> {
+    assert_ne!(n_channels, 0);
+
     // Get the default track in the audio stream.
     let track = probed
         .format
@@ -598,9 +587,7 @@ pub(crate) fn decode_native_bitdepth(
                 }
             },
             Err(symphonia::core::errors::Error::DecodeError(err)) => {
-                // Decode errors are not fatal. Print the error message and try to decode the next
-                // packet as usual.
-                log::warn!("Symphonia decode warning: {}", err);
+                decode_warning(err);
             }
             Err(e) => return Err(LoadError::ErrorWhileDecoding(e)),
         };
@@ -620,12 +607,6 @@ pub(crate) fn decode_native_bitdepth(
             )
             .into(),
         )
-    };
-
-    let decode_warning = |err: &str| {
-        // Decode errors are not fatal. Print the error message and try to decode the next
-        // packet as usual.
-        log::warn!("Symphonia decode warning: {}", err);
     };
 
     let pcm_type = match first_packet.take().unwrap() {
@@ -1034,4 +1015,10 @@ fn decode_f64_packet(
     for i in 0..num_channels {
         decoded_channels[i].extend_from_slice(packet.chan(i));
     }
+}
+
+fn decode_warning(err: &str) {
+    // Decode errors are not fatal. Print the error message and try to decode the next
+    // packet as usual.
+    log::warn!("Symphonia decode warning: {}", err);
 }

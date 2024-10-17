@@ -37,7 +37,7 @@ pub fn main() {
         SupportedBufferSize::Range { max, .. } => *max,
         SupportedBufferSize::Unknown => 4096,
     } as usize;
-    assert!(channels >= 2);
+    assert!(channels == 2);
 
     log::info!("Selected stream sample rate: {}", sample_rate);
 

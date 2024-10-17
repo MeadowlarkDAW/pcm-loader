@@ -13,6 +13,11 @@ pub enum LoadError {
     ErrorWhileDecoding(symphonia::core::errors::Error),
     UnexpectedErrorWhileDecoding(Box<dyn Error>),
     #[cfg(feature = "resampler")]
+    InvalidResampler {
+        needed_channels: usize,
+        got_channels: usize,
+    },
+    #[cfg(feature = "resampler")]
     ErrorWhileResampling(rubato::ResampleError),
 }
 
@@ -23,21 +28,32 @@ impl fmt::Display for LoadError {
         use LoadError::*;
 
         match self {
-            FileNotFound(e) => write!(f, "File not found | {}", e),
-            UnkownFormat(e) => write!(f, "Format not supported | {}", e),
+            FileNotFound(e) => write!(f, "File not found: {}", e),
+            UnkownFormat(e) => write!(f, "Format not supported: {}", e),
             NoTrackFound => write!(f, "No default track found"),
             NoChannelsFound => write!(f, "No channels found"),
             UnkownChannelFormat(n_channels) => {
-                write!(f, "Unkown channel format | {} channels found", n_channels)
+                write!(f, "Unkown channel format: {} channels found", n_channels)
             }
             FileTooLarge(max_bytes) => {
-                write!(f, "File is too large | maximum is {} bytes", max_bytes)
+                write!(f, "File is too large: maximum is {} bytes", max_bytes)
             }
-            CouldNotCreateDecoder(e) => write!(f, "Failed to create decoder | {}", e),
-            ErrorWhileDecoding(e) => write!(f, "Error while decoding | {}", e),
-            UnexpectedErrorWhileDecoding(e) => write!(f, "Unexpected error while decoding | {}", e),
+            CouldNotCreateDecoder(e) => write!(f, "Failed to create decoder: {}", e),
+            ErrorWhileDecoding(e) => write!(f, "Error while decoding: {}", e),
+            UnexpectedErrorWhileDecoding(e) => write!(f, "Unexpected error while decoding: {}", e),
             #[cfg(feature = "resampler")]
-            ErrorWhileResampling(e) => write!(f, "Error while resampling | {}", e),
+            InvalidResampler {
+                got_channels,
+                needed_channels,
+            } => {
+                write!(
+                    f,
+                    "Invalid custom resampler: Expected {} channels, got {} channels",
+                    needed_channels, got_channels
+                )
+            }
+            #[cfg(feature = "resampler")]
+            ErrorWhileResampling(e) => write!(f, "Error while resampling: {}", e),
         }
     }
 }

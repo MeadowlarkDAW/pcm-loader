@@ -12,8 +12,9 @@ use rubato::{
 use rubato::FftFixedIn;
 
 /// The quality of the resampling algorithm to use.
-#[derive(Default)]
-pub enum ResampleQuality<'a> {
+#[repr(u32)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ResampleQuality {
     /// Low quality, fast performance
     ///
     /// More specifically, this uses the [`FastFixedIn`] resampler from
@@ -48,19 +49,6 @@ pub enum ResampleQuality<'a> {
     /// }
     /// ```
     High,
-    /// Use a custom resampler
-    Custom(ResamplerRefMut<'a>),
-}
-
-impl<'a> Debug for ResampleQuality<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ResampleQuality::Low => write!(f, "Low"),
-            ResampleQuality::Normal => write!(f, "Normal"),
-            ResampleQuality::High => write!(f, "High"),
-            ResampleQuality::Custom(_) => write!(f, "Custom"),
-        }
-    }
 }
 
 /// A reference to a custom resampler.
@@ -155,12 +143,12 @@ impl<'a> ResamplerRefMut<'a> {
     }
 }
 
-#[repr(u32)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum ResampleQualityKey {
-    Low,
-    Normal,
-    High,
+/// The parameters to get a custom resampler
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ResamplerParams {
+    pub num_channels: usize,
+    pub source_sample_rate: u32,
+    pub target_sample_rate: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -168,7 +156,7 @@ pub(crate) struct ResamplerKey {
     pcm_sr: u32,
     target_sr: u32,
     channels: u32,
-    quality: ResampleQualityKey,
+    quality: ResampleQuality,
 }
 
 pub(crate) enum ResamplerOwned {
@@ -191,7 +179,7 @@ impl ResamplerOwned {
 
 pub(crate) fn get_resampler<'a>(
     resamplers: &'a mut HashMap<ResamplerKey, ResamplerOwned>,
-    resample_quality: ResampleQuality<'a>,
+    resample_quality: ResampleQuality,
     pcm_sr: u32,
     target_sr: u32,
     n_channels: usize,
@@ -204,7 +192,7 @@ pub(crate) fn get_resampler<'a>(
                 pcm_sr,
                 target_sr,
                 channels: n_channels as u32,
-                quality: ResampleQualityKey::Low,
+                quality: ResampleQuality::Low,
             })
             .or_insert_with(|| {
                 ResamplerOwned::Fast(
@@ -224,7 +212,7 @@ pub(crate) fn get_resampler<'a>(
                 pcm_sr,
                 target_sr,
                 channels: n_channels as u32,
-                quality: ResampleQualityKey::Normal,
+                quality: ResampleQuality::Normal,
             })
             .or_insert_with(|| {
                 #[cfg(feature = "fft-resampler")]
@@ -257,7 +245,7 @@ pub(crate) fn get_resampler<'a>(
                 pcm_sr,
                 target_sr,
                 channels: n_channels as u32,
-                quality: ResampleQualityKey::High,
+                quality: ResampleQuality::High,
             })
             .or_insert_with(|| {
                 let sinc_len = 128;
@@ -286,13 +274,5 @@ pub(crate) fn get_resampler<'a>(
                 )
             })
             .as_ref_mut(),
-        ResampleQuality::Custom(resampler) => {
-            if resampler.num_channels() != n_channels {
-                // return error
-                todo!()
-            }
-
-            resampler
-        }
     }
 }

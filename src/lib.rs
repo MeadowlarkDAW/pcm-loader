@@ -1,12 +1,17 @@
-use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
+
+#[cfg(feature = "resampler")]
+use std::collections::HashMap;
 
 use symphonia::core::codecs::CodecRegistry;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::{Hint, Probe, ProbeResult};
+
+// Re-export symphonia
+pub use symphonia;
 
 pub mod convert;
 pub mod error;
@@ -16,13 +21,10 @@ pub mod resample;
 #[cfg(feature = "resampler")]
 pub use resample::ResampleQuality;
 #[cfg(feature = "resampler")]
-use resample::{ResamplerKey, ResamplerOwned, ResamplerRefMut};
+use resample::{ResamplerKey, ResamplerOwned, ResamplerParams, ResamplerRefMut};
 
 mod decode;
 mod resource;
-
-// Re-export symphonia
-pub use symphonia;
 
 pub use resource::*;
 
@@ -77,29 +79,24 @@ impl SymphoniumLoader {
         #[cfg(feature = "resampler")] resample_quality: ResampleQuality,
         max_bytes: Option<usize>,
     ) -> Result<DecodedAudio, LoadError> {
-        let path: &Path = path.as_ref();
+        let source = load_file(path, self.probe)?;
 
-        // Try to open the file.
-        let file = File::open(path)?;
-
-        // Create a hint to help the format registry guess what format reader is appropriate.
-        let mut hint = Hint::new();
-
-        // Provide the file extension as a hint.
-        if let Some(extension) = path.extension() {
-            if let Some(extension_str) = extension.to_str() {
-                hint.with_extension(extension_str);
-            }
-        }
-
-        self.load_from_source(
-            Box::new(file),
-            Some(hint),
+        decode(
+            source,
+            self.codec_registry,
+            max_bytes,
             #[cfg(feature = "resampler")]
             target_sample_rate,
             #[cfg(feature = "resampler")]
-            resample_quality,
-            max_bytes,
+            |params| {
+                self::resample::get_resampler(
+                    &mut self.resamplers,
+                    resample_quality,
+                    params.source_sample_rate,
+                    params.target_sample_rate,
+                    params.num_channels,
+                )
+            },
         )
     }
 
@@ -130,50 +127,88 @@ impl SymphoniumLoader {
         #[cfg(feature = "resampler")] resample_quality: ResampleQuality,
         max_bytes: Option<usize>,
     ) -> Result<DecodedAudio, LoadError> {
-        let LoadedAudioFile {
-            mut probed,
-            sample_rate,
-            n_channels,
-        } = load_audio_file(source, hint, self.probe)?;
+        let source = load_audio_source(source, hint, self.probe)?;
 
-        #[cfg(feature = "resampler")]
-        if let Some(target_sr) = target_sample_rate {
-            if sample_rate != target_sr {
-                // Resampling is needed.
-
-                let mut resampler = self::resample::get_resampler(
+        decode(
+            source,
+            self.codec_registry,
+            max_bytes,
+            #[cfg(feature = "resampler")]
+            target_sample_rate,
+            #[cfg(feature = "resampler")]
+            |params| {
+                self::resample::get_resampler(
                     &mut self.resamplers,
                     resample_quality,
-                    sample_rate,
-                    target_sr,
-                    n_channels,
-                );
+                    params.source_sample_rate,
+                    params.target_sample_rate,
+                    params.num_channels,
+                )
+            },
+        )
+    }
 
-                resampler.reset();
+    /// Load an audio file from the given path into RAM using a custom resampler.
+    ///
+    /// * `path` - The path to the audio file stored on disk.
+    /// * `target_sample_rate` - The target sample rate. (No resampling will occur if the audio
+    /// file's sample rate is already the target sample rate).
+    /// * `max_bytes` - The maximum size in bytes that the resulting `DecodedAudio`
+    /// resource can  be in RAM. If the resulting resource is larger than this, then an error
+    /// will be returned instead. This is useful to avoid locking up or crashing the system
+    /// if the use tries to load a really large audio file.
+    ///     * If this is `None`, then default of `1_000_000_000` (1GB) will be used.
+    /// * `get_resampler` - Get the custom sampler with the desired parameters.
+    #[cfg(feature = "resampler")]
+    pub fn load_with_resampler<'a, P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        target_sample_rate: u32,
+        max_bytes: Option<usize>,
+        get_resampler: impl FnOnce(ResamplerParams) -> ResamplerRefMut<'a>,
+    ) -> Result<DecodedAudio, LoadError> {
+        let source = load_file(path, self.probe)?;
 
-                let pcm = decode::decode_resampled(
-                    &mut probed,
-                    self.codec_registry,
-                    sample_rate,
-                    target_sr,
-                    n_channels,
-                    resampler,
-                    max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
-                )?;
-
-                return Ok(pcm.into_decoded_audio());
-            }
-        }
-
-        let pcm = decode::decode_native_bitdepth(
-            &mut probed,
-            n_channels,
+        decode(
+            source,
             self.codec_registry,
-            sample_rate,
-            max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
-        )?;
+            max_bytes,
+            Some(target_sample_rate),
+            get_resampler,
+        )
+    }
 
-        Ok(pcm)
+    /// Load an audio source into RAM using a custom resampler.
+    ///
+    /// * `source` - The audio source which implements the [`MediaSource`] trait.
+    /// * `hint` - An optional hint to help the format registry guess what format reader is
+    /// appropriate.
+    /// * `target_sample_rate` - The target sample rate. (No resampling will occur if the audio
+    /// file's sample rate is already the target sample rate).
+    /// * `max_bytes` - The maximum size in bytes that the resulting `DecodedAudio`
+    /// resource can  be in RAM. If the resulting resource is larger than this, then an error
+    /// will be returned instead. This is useful to avoid locking up or crashing the system
+    /// if the use tries to load a really large audio file.
+    ///     * If this is `None`, then default of `1_000_000_000` (1GB) will be used.
+    /// * `get_resampler` - Get the custom sampler with the desired parameters.
+    #[cfg(feature = "resampler")]
+    pub fn load_from_source_with_resampler<'a>(
+        &mut self,
+        source: Box<dyn MediaSource>,
+        hint: Option<Hint>,
+        target_sample_rate: u32,
+        max_bytes: Option<usize>,
+        get_resampler: impl FnOnce(ResamplerParams) -> ResamplerRefMut<'a>,
+    ) -> Result<DecodedAudio, LoadError> {
+        let source = load_audio_source(source, hint, self.probe)?;
+
+        decode(
+            source,
+            self.codec_registry,
+            max_bytes,
+            Some(target_sample_rate),
+            get_resampler,
+        )
     }
 
     /// Load an audio file from the given path into RAM and convert to an f32 sample format.
@@ -200,29 +235,24 @@ impl SymphoniumLoader {
         #[cfg(feature = "resampler")] resample_quality: ResampleQuality,
         max_bytes: Option<usize>,
     ) -> Result<DecodedAudioF32, LoadError> {
-        let path: &Path = path.as_ref();
+        let source = load_file(path, self.probe)?;
 
-        // Try to open the file.
-        let file = File::open(path)?;
-
-        // Create a hint to help the format registry guess what format reader is appropriate.
-        let mut hint = Hint::new();
-
-        // Provide the file extension as a hint.
-        if let Some(extension) = path.extension() {
-            if let Some(extension_str) = extension.to_str() {
-                hint.with_extension(extension_str);
-            }
-        }
-
-        self.load_from_source_f32(
-            Box::new(file),
-            Some(hint),
+        decode_f32(
+            source,
+            self.codec_registry,
+            max_bytes,
             #[cfg(feature = "resampler")]
             target_sample_rate,
             #[cfg(feature = "resampler")]
-            resample_quality,
-            max_bytes,
+            |params| {
+                self::resample::get_resampler(
+                    &mut self.resamplers,
+                    resample_quality,
+                    params.source_sample_rate,
+                    params.target_sample_rate,
+                    params.num_channels,
+                )
+            },
         )
     }
 
@@ -245,7 +275,7 @@ impl SymphoniumLoader {
     /// will be returned instead. This is useful to avoid locking up or crashing the system
     /// if the use tries to load a really large audio file.
     ///     * If this is `None`, then default of `1_000_000_000` (1GB) will be used.
-    pub fn load_from_source_f32(
+    pub fn load_f32_from_source(
         &mut self,
         source: Box<dyn MediaSource>,
         hint: Option<Hint>,
@@ -253,64 +283,126 @@ impl SymphoniumLoader {
         #[cfg(feature = "resampler")] resample_quality: ResampleQuality,
         max_bytes: Option<usize>,
     ) -> Result<DecodedAudioF32, LoadError> {
-        let LoadedAudioFile {
-            mut probed,
-            sample_rate,
-            n_channels,
-        } = load_audio_file(source, hint, self.probe)?;
+        let source = load_audio_source(source, hint, self.probe)?;
 
-        #[cfg(feature = "resampler")]
-        if let Some(target_sr) = target_sample_rate {
-            if sample_rate != target_sr {
-                // Resampling is needed.
-
-                let mut resampler = self::resample::get_resampler(
+        decode_f32(
+            source,
+            self.codec_registry,
+            max_bytes,
+            #[cfg(feature = "resampler")]
+            target_sample_rate,
+            #[cfg(feature = "resampler")]
+            |params| {
+                self::resample::get_resampler(
                     &mut self.resamplers,
                     resample_quality,
-                    sample_rate,
-                    target_sr,
-                    n_channels,
-                );
+                    params.source_sample_rate,
+                    params.target_sample_rate,
+                    params.num_channels,
+                )
+            },
+        )
+    }
 
-                resampler.reset();
+    /// Load an audio source into RAM using a custom resampler and convert to an f32 sample
+    /// format.
+    ///
+    /// * `path` - The path to the audio file stored on disk.
+    /// * `target_sample_rate` - The target sample rate. (No resampling will occur if the audio
+    /// file's sample rate is already the target sample rate).
+    /// * `max_bytes` - The maximum size in bytes that the resulting `DecodedAudio`
+    /// resource can  be in RAM. If the resulting resource is larger than this, then an error
+    /// will be returned instead. This is useful to avoid locking up or crashing the system
+    /// if the use tries to load a really large audio file.
+    ///     * If this is `None`, then default of `1_000_000_000` (1GB) will be used.
+    /// * `get_resampler` - Get the custom sampler with the desired parameters.
+    #[cfg(feature = "resampler")]
+    pub fn load_f32_with_resampler<'a, P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        target_sample_rate: u32,
+        max_bytes: Option<usize>,
+        get_resampler: impl FnOnce(ResamplerParams) -> ResamplerRefMut<'a>,
+    ) -> Result<DecodedAudioF32, LoadError> {
+        let source = load_file(path, self.probe)?;
 
-                let pcm = decode::decode_resampled(
-                    &mut probed,
-                    self.codec_registry,
-                    sample_rate,
-                    target_sr,
-                    n_channels,
-                    resampler,
-                    max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
-                )?;
-
-                return Ok(pcm);
-            }
-        }
-
-        let pcm = decode::decode_f32(
-            &mut probed,
-            n_channels,
+        decode_f32(
+            source,
             self.codec_registry,
-            sample_rate,
-            max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
-        )?;
+            max_bytes,
+            Some(target_sample_rate),
+            get_resampler,
+        )
+    }
 
-        Ok(pcm)
+    /// Load an audio source into RAM using a custom resampler and convert to an f32 sample
+    /// format.
+    ///
+    /// * `source` - The audio source which implements the [`MediaSource`] trait.
+    /// * `hint` - An optional hint to help the format registry guess what format reader is
+    /// appropriate.
+    /// * `target_sample_rate` - The target sample rate. (No resampling will occur if the audio
+    /// file's sample rate is already the target sample rate).
+    /// * `max_bytes` - The maximum size in bytes that the resulting `DecodedAudio`
+    /// resource can  be in RAM. If the resulting resource is larger than this, then an error
+    /// will be returned instead. This is useful to avoid locking up or crashing the system
+    /// if the use tries to load a really large audio file.
+    ///     * If this is `None`, then default of `1_000_000_000` (1GB) will be used.
+    /// * `get_resampler` - Get the custom sampler with the desired parameters.
+    #[cfg(feature = "resampler")]
+    pub fn load_f32_from_source_with_resampler<'a>(
+        &mut self,
+        source: Box<dyn MediaSource>,
+        hint: Option<Hint>,
+        target_sample_rate: u32,
+        max_bytes: Option<usize>,
+        get_resampler: impl FnOnce(ResamplerParams) -> ResamplerRefMut<'a>,
+    ) -> Result<DecodedAudioF32, LoadError> {
+        let source = load_audio_source(source, hint, self.probe)?;
+
+        decode_f32(
+            source,
+            self.codec_registry,
+            max_bytes,
+            Some(target_sample_rate),
+            get_resampler,
+        )
     }
 }
 
-struct LoadedAudioFile {
+struct LoadedAudioSource {
     probed: ProbeResult,
     sample_rate: u32,
     n_channels: usize,
 }
 
-fn load_audio_file(
+fn load_file<P: AsRef<Path>>(
+    path: P,
+    probe: &'static Probe,
+) -> Result<LoadedAudioSource, LoadError> {
+    let path: &Path = path.as_ref();
+
+    // Try to open the file.
+    let file = File::open(path)?;
+
+    // Create a hint to help the format registry guess what format reader is appropriate.
+    let mut hint = Hint::new();
+
+    // Provide the file extension as a hint.
+    if let Some(extension) = path.extension() {
+        if let Some(extension_str) = extension.to_str() {
+            hint.with_extension(extension_str);
+        }
+    }
+
+    load_audio_source(Box::new(file), Some(hint), probe)
+}
+
+fn load_audio_source(
     source: Box<dyn MediaSource>,
     hint: Option<Hint>,
     probe: &'static Probe,
-) -> Result<LoadedAudioFile, LoadError> {
+) -> Result<LoadedAudioSource, LoadError> {
     // Create the media source stream.
     let mss = MediaSourceStream::new(source, Default::default());
 
@@ -342,9 +434,112 @@ fn load_audio_file(
         .ok_or_else(|| LoadError::NoChannelsFound)?
         .count();
 
-    Ok(LoadedAudioFile {
+    if n_channels == 0 {
+        return Err(LoadError::NoChannelsFound);
+    }
+
+    Ok(LoadedAudioSource {
         probed,
         sample_rate,
         n_channels,
     })
+}
+
+fn decode<'a>(
+    mut source: LoadedAudioSource,
+    codec_registry: &'static CodecRegistry,
+    max_bytes: Option<usize>,
+    #[cfg(feature = "resampler")] target_sample_rate: Option<u32>,
+    #[cfg(feature = "resampler")] get_resampler: impl FnOnce(ResamplerParams) -> ResamplerRefMut<'a>,
+) -> Result<DecodedAudio, LoadError> {
+    #[cfg(feature = "resampler")]
+    if let Some(target_sample_rate) = target_sample_rate {
+        if source.sample_rate != target_sample_rate {
+            // Resampling is needed.
+            return resample(
+                source,
+                codec_registry,
+                max_bytes,
+                target_sample_rate,
+                get_resampler,
+            )
+            .map(|pcm| pcm.into());
+        }
+    }
+
+    let pcm = decode::decode_native_bitdepth(
+        &mut source.probed,
+        source.n_channels,
+        codec_registry,
+        source.sample_rate,
+        max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
+    )?;
+
+    Ok(pcm)
+}
+
+fn decode_f32<'a>(
+    mut source: LoadedAudioSource,
+    codec_registry: &'static CodecRegistry,
+    max_bytes: Option<usize>,
+    #[cfg(feature = "resampler")] target_sample_rate: Option<u32>,
+    #[cfg(feature = "resampler")] get_resampler: impl FnOnce(ResamplerParams) -> ResamplerRefMut<'a>,
+) -> Result<DecodedAudioF32, LoadError> {
+    #[cfg(feature = "resampler")]
+    if let Some(target_sample_rate) = target_sample_rate {
+        if source.sample_rate != target_sample_rate {
+            // Resampling is needed.
+            return resample(
+                source,
+                codec_registry,
+                max_bytes,
+                target_sample_rate,
+                get_resampler,
+            );
+        }
+    }
+
+    let pcm = decode::decode_f32(
+        &mut source.probed,
+        source.n_channels,
+        codec_registry,
+        source.sample_rate,
+        max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
+    )?;
+
+    Ok(pcm)
+}
+
+#[cfg(feature = "resampler")]
+fn resample<'a>(
+    mut source: LoadedAudioSource,
+    codec_registry: &'static CodecRegistry,
+    max_bytes: Option<usize>,
+    target_sample_rate: u32,
+    get_resampler: impl FnOnce(ResamplerParams) -> ResamplerRefMut<'a>,
+) -> Result<DecodedAudioF32, LoadError> {
+    let resampler = get_resampler(ResamplerParams {
+        num_channels: source.n_channels,
+        source_sample_rate: source.sample_rate,
+        target_sample_rate,
+    });
+
+    if resampler.num_channels() != source.n_channels {
+        return Err(LoadError::InvalidResampler {
+            needed_channels: source.n_channels,
+            got_channels: resampler.num_channels(),
+        });
+    }
+
+    let pcm = decode::decode_resampled(
+        &mut source.probed,
+        codec_registry,
+        source.sample_rate,
+        target_sample_rate,
+        source.n_channels,
+        resampler,
+        max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
+    )?;
+
+    return Ok(pcm);
 }
