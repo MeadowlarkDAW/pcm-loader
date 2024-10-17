@@ -25,12 +25,12 @@ pub enum ResampleQuality {
     ///
     /// This is recommended for most applications.
     ///
-    /// More specifically, if the `fft` feature is enabled (which it is by default),
-    /// then this uses the [`FftFixedIn`] resampler from rubato with a chunk size of
-    /// `1024` and 2 sub chunks.
-    ///
-    /// If the `fft` feature is not enabled then this uses the [`FastFixedIn`]
-    /// resampler from rubato with an interpolation type of
+    /// More specifically, if the `fft-resampler` feature is enabled (which
+    /// it is by default), then this uses the [`FftFixedIn`] resampler from
+    /// rubato with a chunk size of `1024` and 2 sub chunks.
+    ///S
+    /// If the `fft-resampler` feature is not enabled then this uses the
+    /// [`FastFixedIn`] resampler from rubato with an interpolation type of
     /// [`PolynomialDegree::Quintic`] and a chunk size of `1024`.
     #[default]
     Normal,
