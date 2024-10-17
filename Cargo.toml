@@ -1,30 +1,111 @@
 [package]
-name = "pcm-loader"
+name = "symphonium"
 version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
 readme = "README.md"
-repository = "https://github.com/MeadowlarkDAW/pcm-loader"
-description = "Easily load audio files into RAM"
+repository = "https://github.com/MeadowlarkDAW/symphonium"
+description = "An unofficial easy-to-use wrapper around Symphonia for loading audio files"
 categories = ["multimedia", "multimedia::audio", "multimedia::encoding"]
 keywords = ["audio", "codec", "decoder", "multimedia", "media"]
-publish = false # TODO: Remove this when ready to publish
+exclude = ["test_files/"]
+
+# Show documentation with all features enabled on docs.rs
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
-default = ["flac", "mkv", "ogg", "pcm", "vorbis", "wav"]
+default = ["wav", "pcm", "ogg", "vorbis", "fft-resampler"]
+
+# Enable specific codecs and formats.
 aac = ["symphonia/aac"]
+adpcm = ["symphonia/adpcm"]
 alac = ["symphonia/alac"]
 flac = ["symphonia/flac"]
+caf = ["symphonia/caf"]
 isomp4 = ["symphonia/isomp4"]
 mkv = ["symphonia/mkv"]
+mp1 = ["symphonia/mp1"]
+mp2 = ["symphonia/mp2"]
 mp3 = ["symphonia/mp3"]
 ogg = ["symphonia/ogg"]
 pcm = ["symphonia/pcm"]
+aiff = ["symphonia/aiff"]
 vorbis = ["symphonia/vorbis"]
 wav = ["symphonia/wav"]
 
+# Enable all royalty-free open standard codecs and formats.
+open-standards = [
+    "adpcm",
+    "flac",
+    "mkv",
+    "ogg",
+    "pcm",
+    "vorbis",
+    "wav"
+]
+
+# Enable all MPEG audio codecs.
+mpa = ["mp1", "mp2", "mp3"]
+
+# Enable all supported codecs.
+all-codecs = [
+    "aac",
+    "adpcm",
+    "alac",
+    "flac",
+    "mp1",
+    "mp2",
+    "mp3",
+    "pcm",
+    "vorbis",
+]
+
+# Enable all supported formats.
+all-formats = [
+    "caf",
+    "isomp4",
+    "mkv",
+    "ogg",
+    "aiff",
+    "wav"
+]
+
+# Enable all supported codecs and formats.
+all = [
+    "all-codecs",
+    "all-formats",
+]
+
+# SIMD support.
+opt-simd-sse = ["symphonia/opt-simd-sse"]
+opt-simd-avx = ["symphonia/opt-simd-avx"]
+opt-simd-neon = ["symphonia/opt-simd-neon"]
+
+# Enable all SIMD support. Enabled by default.
+opt-simd = [
+    "opt-simd-sse",
+    "opt-simd-avx",
+    "opt-simd-neon",
+]
+
+# Enable the resampler (enabled by default).
+resampler = ["dep:rubato"]
+
+# This feature is enabled by default and is recommended for most
+# applications. Disable it if the FFT resamplers are not needed
+# to save compile time and reduce the resulting binary size.
+fft-resampler = ["resampler", "rubato?/fft_resampler"]
+
 [dependencies]
-samplerate-rs = { git = "https://github.com/MeadowlarkDAW/samplerate-rs.git", branch = "master" }
-symphonia = { version = "0.5", default-features = false }
-fnv = "1.0"
+symphonia = { version = "0.5.4", default-features = false }
+rubato = { version = "0.16.0", default-features = false, optional = true }
 log = "0.4"
+
+[dev-dependencies]
+cpal = "0.15.3"
+simple-log = "2.1.1"
+
+# Decoding audio can be quite slow without any optimizations.
+[profile.dev]
+opt-level = 1 

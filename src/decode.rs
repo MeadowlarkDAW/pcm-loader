@@ -1,50 +1,271 @@
 use std::borrow::Cow;
 
 use symphonia::core::audio::AudioBufferRef;
-use symphonia::core::audio::{AudioBuffer, SampleBuffer, Signal};
+use symphonia::core::audio::{AudioBuffer, Signal};
 use symphonia::core::codecs::{CodecRegistry, DecoderOptions};
 use symphonia::core::probe::ProbeResult;
 use symphonia::core::sample::{i24, u24};
 
-use super::ram::{PcmRAM, PcmRAMType};
-use super::{convert, PcmLoadError};
+use crate::DecodedAudioF32;
 
-pub(crate) fn decode_f32_resampled(
+#[cfg(feature = "resampler")]
+use crate::ResamplerRefMut;
+
+use super::resource::{DecodedAudio, DecodedAudioType};
+use super::{convert, LoadError};
+
+const SHRINK_THRESHOLD: usize = 4096;
+
+#[cfg(feature = "resampler")]
+pub(crate) fn decode_resampled(
     probed: &mut ProbeResult,
     codec_registry: &CodecRegistry,
     pcm_sample_rate: u32,
     target_sample_rate: u32,
     n_channels: usize,
-    resampler: &mut samplerate_rs::Samplerate,
+    mut resampler: ResamplerRefMut,
     max_bytes: usize,
-) -> Result<PcmRAM, PcmLoadError> {
+) -> Result<DecodedAudioF32, LoadError> {
+    assert_ne!(n_channels, 0);
+
     // Get the default track in the audio stream.
     let track = probed
         .format
         .default_track()
-        .ok_or_else(|| PcmLoadError::NoTrackFound)?;
+        .ok_or_else(|| LoadError::NoTrackFound)?;
 
-    let n_frames = track.codec_params.n_frames;
+    let file_frames = track.codec_params.n_frames;
+    let max_frames = max_bytes / (4 * n_channels);
+
+    if let Some(frames) = file_frames {
+        if frames > max_frames as u64 {
+            return Err(LoadError::FileTooLarge(max_bytes));
+        }
+    }
 
     let decode_opts: DecoderOptions = Default::default();
 
     // Create a decoder for the track.
     let mut decoder = codec_registry
         .make(&track.codec_params, &decode_opts)
-        .map_err(|e| PcmLoadError::CouldNotCreateDecoder(e))?;
+        .map_err(|e| LoadError::CouldNotCreateDecoder(e))?;
 
-    let mut total_frames = 0;
-    let max_frames = max_bytes / (4 * n_channels);
+    let mut tmp_conversion_buf: Option<AudioBuffer<f32>> = None;
+    let mut tmp_resampler_in_buf = vec![vec![0.0; resampler.input_frames_max()]; n_channels];
+    let mut tmp_resampler_out_buf = vec![vec![0.0; resampler.output_frames_max()]; n_channels];
+    let mut tmp_resampler_in_len = 0;
 
-    let mut sample_buf = None;
-    let mut resampled_sample_buf: Vec<f32> = Vec::new();
+    let estimated_final_frames = (file_frames.unwrap_or(44100) as f64
+        * (target_sample_rate as f64 / pcm_sample_rate as f64))
+        .ceil() as usize
+        + resampler.output_frames_max();
+    let mut final_buf: Vec<Vec<f32>> = (0..n_channels)
+        .map(|_| {
+            let mut m = Vec::new();
+            m.reserve_exact(estimated_final_frames);
+            m
+        })
+        .collect();
 
-    let resampled_frames = (n_frames.unwrap_or(44100) as f64 * target_sample_rate as f64
-        / pcm_sample_rate as f64)
+    let mut total_in_frames: usize = 0;
+
+    let track_id = track.id;
+
+    let decode_warning = |err: &str| {
+        // Decode errors are not fatal. Print the error message and try to decode the next
+        // packet as usual.
+        log::warn!("Symphonia decode warning: {}", err);
+    };
+
+    let mut desired_tmp_in_frames = resampler.input_frames_next();
+    let mut delay_frames_left = resampler.output_delay();
+
+    let mut resample = |tmp_resampler_in_buf: &Vec<Vec<f32>>,
+                        tmp_resampler_out_buf: &mut Vec<Vec<f32>>,
+                        final_buf: &mut Vec<Vec<f32>>,
+                        tmp_resampler_in_len: &mut usize,
+                        desired_tmp_in_frames: &mut usize|
+     -> Result<(), LoadError> {
+        let (_, output_frames) =
+            resampler.process_into_buffer(tmp_resampler_in_buf, tmp_resampler_out_buf, None)?;
+
+        if delay_frames_left >= output_frames {
+            // Wait until the first non-delayed output sample.
+            delay_frames_left -= output_frames;
+        } else {
+            for (final_ch, res_ch) in final_buf.iter_mut().zip(tmp_resampler_out_buf.iter()) {
+                final_ch.extend_from_slice(&res_ch[delay_frames_left..output_frames]);
+            }
+            delay_frames_left = 0;
+        }
+
+        *desired_tmp_in_frames = resampler.input_frames_next();
+        *tmp_resampler_in_len = 0;
+
+        Ok(())
+    };
+
+    while let Ok(packet) = probed.format.next_packet() {
+        // If the packet does not belong to the selected track, skip over it.
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        match decoder.decode(&packet) {
+            Ok(decoded) => {
+                // If this is the first decoded packet, allocate the temporary conversion
+                // buffer with the required capacity.
+                if tmp_conversion_buf.is_none() {
+                    let spec = *(decoded.spec());
+                    let duration = decoded.capacity();
+
+                    tmp_conversion_buf = Some(AudioBuffer::new(duration as u64, spec));
+                }
+                let tmp_conversion_buf = tmp_conversion_buf.as_mut().unwrap();
+                if tmp_conversion_buf.capacity() < decoded.capacity() {
+                    let spec = *(decoded.spec());
+                    let duration = decoded.capacity();
+
+                    *tmp_conversion_buf = AudioBuffer::new(duration as u64, spec);
+                }
+
+                decoded.convert(tmp_conversion_buf);
+                let tmp_conversion_planes = tmp_conversion_buf.planes();
+                let converted_planes = tmp_conversion_planes.planes();
+
+                // Fill the temporary input buffer for the resampler.
+                let decoded_frames = tmp_conversion_buf.frames();
+                let mut total_copied_frames = 0;
+                while total_copied_frames < decoded_frames {
+                    let copy_frames = (decoded_frames - total_copied_frames)
+                        .min(desired_tmp_in_frames - tmp_resampler_in_len);
+                    for (tmp_ch, decoded_ch) in
+                        tmp_resampler_in_buf.iter_mut().zip(converted_planes)
+                    {
+                        tmp_ch[tmp_resampler_in_len..tmp_resampler_in_len + copy_frames]
+                            .copy_from_slice(
+                                &decoded_ch[total_copied_frames..total_copied_frames + copy_frames],
+                            );
+                    }
+
+                    tmp_resampler_in_len += copy_frames;
+                    if tmp_resampler_in_len == desired_tmp_in_frames {
+                        resample(
+                            &tmp_resampler_in_buf,
+                            &mut tmp_resampler_out_buf,
+                            &mut final_buf,
+                            &mut tmp_resampler_in_len,
+                            &mut desired_tmp_in_frames,
+                        )?;
+                    }
+
+                    total_copied_frames += copy_frames;
+                }
+
+                if file_frames.is_none() {
+                    // Protect against really large files causing out of memory errors.
+                    if final_buf[0].len() > max_frames {
+                        return Err(LoadError::FileTooLarge(max_bytes));
+                    }
+                }
+
+                total_in_frames += decoded_frames;
+            }
+            Err(symphonia::core::errors::Error::DecodeError(err)) => decode_warning(err),
+            Err(e) => return Err(LoadError::ErrorWhileDecoding(e)),
+        }
+    }
+
+    let total_frames = (total_in_frames as f64
+        * (target_sample_rate as f64 / pcm_sample_rate as f64))
         .ceil() as usize;
 
-    let mut resampled_channels: Vec<Vec<f32>> = (0..n_channels)
-        .map(|_| Vec::with_capacity(resampled_frames))
+    // Process any leftover samples.
+    if tmp_resampler_in_len > 0 {
+        // Zero-pad remaining samples.
+        for ch in tmp_resampler_in_buf.iter_mut() {
+            ch[tmp_resampler_in_len..desired_tmp_in_frames].fill(0.0);
+        }
+
+        resample(
+            &tmp_resampler_in_buf,
+            &mut tmp_resampler_out_buf,
+            &mut final_buf,
+            &mut tmp_resampler_in_len,
+            &mut desired_tmp_in_frames,
+        )?;
+    }
+
+    // Extract any leftover samples from the resampler.
+    while final_buf[0].len() < total_frames {
+        // Clear samples.
+        for ch in tmp_resampler_in_buf.iter_mut() {
+            ch[..desired_tmp_in_frames].fill(0.0);
+        }
+
+        resample(
+            &tmp_resampler_in_buf,
+            &mut tmp_resampler_out_buf,
+            &mut final_buf,
+            &mut tmp_resampler_in_len,
+            &mut desired_tmp_in_frames,
+        )?;
+    }
+
+    // Truncate the extra padded data.
+    for ch in final_buf.iter_mut() {
+        ch.resize(total_frames, 0.0);
+
+        // If the allocated capacity is significantly greater than the
+        // length, shrink it to save memory.
+        if ch.capacity() > ch.len() + SHRINK_THRESHOLD {
+            ch.shrink_to_fit();
+        }
+    }
+
+    Ok(DecodedAudioF32::new(final_buf, target_sample_rate))
+}
+
+pub(crate) fn decode_f32(
+    probed: &mut ProbeResult,
+    n_channels: usize,
+    codec_registry: &CodecRegistry,
+    sample_rate: u32,
+    max_bytes: usize,
+) -> Result<DecodedAudioF32, LoadError> {
+    assert_ne!(n_channels, 0);
+
+    // Get the default track in the audio stream.
+    let track = probed
+        .format
+        .default_track()
+        .ok_or_else(|| LoadError::NoTrackFound)?;
+
+    let file_frames = track.codec_params.n_frames;
+    let max_frames = max_bytes / (4 * n_channels);
+
+    if let Some(frames) = file_frames {
+        if frames > max_frames as u64 {
+            return Err(LoadError::FileTooLarge(max_bytes));
+        }
+    }
+
+    let decode_opts: DecoderOptions = Default::default();
+
+    // Create a decoder for the track.
+    let mut decoder = codec_registry
+        .make(&track.codec_params, &decode_opts)
+        .map_err(|e| LoadError::CouldNotCreateDecoder(e))?;
+
+    let mut tmp_conversion_buf: Option<AudioBuffer<f32>> = None;
+
+    let estimated_final_frames = file_frames.unwrap_or(44100) as usize;
+    let mut final_buf: Vec<Vec<f32>> = (0..n_channels)
+        .map(|_| {
+            let mut m = Vec::new();
+            m.reserve_exact(estimated_final_frames);
+            m
+        })
         .collect();
 
     let track_id = track.id;
@@ -63,58 +284,46 @@ pub(crate) fn decode_f32_resampled(
 
         match decoder.decode(&packet) {
             Ok(decoded) => {
-                // If this is the *first* decoded packet, create a sample buffer matching the
-                // decoded audio buffer format.
-                if sample_buf.is_none() {
-                    // Get the audio buffer specification.
-                    let spec = *decoded.spec();
-                    // Get the capacity of the decoded buffer. Note: This is capacity, not length!
+                // If this is the first decoded packet, allocate the temporary conversion
+                // buffer with the required capacity.
+                if tmp_conversion_buf.is_none() {
+                    let spec = *(decoded.spec());
                     let duration = decoded.capacity();
-                    // Create the f32 sample buffer.
-                    sample_buf = Some(SampleBuffer::<f32>::new(duration as u64, spec));
 
-                    let resampled_duration = (duration as f64 * target_sample_rate as f64
-                        / pcm_sample_rate as f64)
-                        .ceil() as usize;
+                    tmp_conversion_buf = Some(AudioBuffer::new(duration as u64, spec));
+                }
+                let tmp_conversion_buf = tmp_conversion_buf.as_mut().unwrap();
+                if tmp_conversion_buf.capacity() < decoded.capacity() {
+                    let spec = *(decoded.spec());
+                    let duration = decoded.capacity();
 
-                    resampled_sample_buf.resize(resampled_duration * n_channels, 0.0);
+                    *tmp_conversion_buf = AudioBuffer::new(duration as u64, spec);
                 }
 
-                if n_frames.is_none() {
-                    total_frames += decoded.frames();
-                    if total_frames > max_frames {
-                        return Err(PcmLoadError::FileTooLarge(max_bytes));
-                    }
+                decoded.convert(tmp_conversion_buf);
+
+                let tmp_conversion_planes = tmp_conversion_buf.planes();
+                let converted_planes = tmp_conversion_planes.planes();
+
+                for (final_ch, decoded_ch) in final_buf.iter_mut().zip(converted_planes) {
+                    final_ch.extend_from_slice(&decoded_ch);
                 }
 
-                let s = sample_buf.as_mut().unwrap();
-                // Copy the decoded audio buffer into the sample buffer in an interleaved format.
-                s.copy_interleaved_ref(decoded);
-
-                resampled_sample_buf = match resampler.process(s.samples()) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return Err(PcmLoadError::ErrorWhileResampling(e));
-                    }
-                };
-
-                let resampled_frames = resampled_sample_buf.len() / n_channels;
-                for ch_i in 0..n_channels {
-                    for i in 0..resampled_frames {
-                        resampled_channels[ch_i]
-                            .push(resampled_sample_buf[(i * n_channels) + ch_i]);
+                if file_frames.is_none() {
+                    // Protect against really large files causing out of memory errors.
+                    if final_buf[0].len() > max_frames {
+                        return Err(LoadError::FileTooLarge(max_bytes));
                     }
                 }
             }
             Err(symphonia::core::errors::Error::DecodeError(err)) => decode_warning(err),
-            Err(e) => return Err(PcmLoadError::ErrorWhileDecoding(e)),
+            Err(e) => return Err(LoadError::ErrorWhileDecoding(e)),
         }
     }
 
-    Ok(PcmRAM::new(
-        PcmRAMType::F32(resampled_channels),
-        target_sample_rate,
-    ))
+    shrink_buffer(&mut final_buf);
+
+    Ok(DecodedAudioF32::new(final_buf, sample_rate))
 }
 
 pub(crate) fn decode_native_bitdepth(
@@ -123,21 +332,21 @@ pub(crate) fn decode_native_bitdepth(
     codec_registry: &CodecRegistry,
     sample_rate: u32,
     max_bytes: usize,
-) -> Result<PcmRAM, PcmLoadError> {
+) -> Result<DecodedAudio, LoadError> {
     // Get the default track in the audio stream.
     let track = probed
         .format
         .default_track()
-        .ok_or_else(|| PcmLoadError::NoTrackFound)?;
+        .ok_or_else(|| LoadError::NoTrackFound)?;
 
-    let n_frames = track.codec_params.n_frames;
+    let file_frames = track.codec_params.n_frames;
 
     let decode_opts: DecoderOptions = Default::default();
 
     // Create a decoder for the track.
     let mut decoder = codec_registry
         .make(&track.codec_params, &decode_opts)
-        .map_err(|e| PcmLoadError::CouldNotCreateDecoder(e))?;
+        .map_err(|e| LoadError::CouldNotCreateDecoder(e))?;
 
     let mut max_frames = 0;
     let mut total_frames = 0;
@@ -157,17 +366,15 @@ pub(crate) fn decode_native_bitdepth(
 
     let track_id = track.id;
 
-    let check_total_frames = |total_frames: &mut usize,
-                              max_frames: usize,
-                              packet_len: usize|
-     -> Result<(), PcmLoadError> {
-        *total_frames += packet_len;
-        if *total_frames > max_frames {
-            Err(PcmLoadError::FileTooLarge(max_bytes))
-        } else {
-            Ok(())
-        }
-    };
+    let check_total_frames =
+        |total_frames: &mut usize, max_frames: usize, packet_len: usize| -> Result<(), LoadError> {
+            *total_frames += packet_len;
+            if *total_frames > max_frames {
+                Err(LoadError::FileTooLarge(max_bytes))
+            } else {
+                Ok(())
+            }
+        };
 
     // Decode the first packet to get the sample format.
     let mut first_packet = None;
@@ -182,13 +389,14 @@ pub(crate) fn decode_native_bitdepth(
                 AudioBufferRef::U8(d) => {
                     let mut decoded_channels = Vec::<Vec<u8>>::new();
                     for _ in 0..n_channels {
-                        decoded_channels.push(Vec::with_capacity(n_frames.unwrap_or(0) as usize));
+                        decoded_channels
+                            .push(Vec::with_capacity(file_frames.unwrap_or(0) as usize));
                     }
 
                     max_frames = max_bytes / n_channels;
-                    if let Some(n_frames) = n_frames {
-                        if n_frames > max_frames as u64 {
-                            return Err(PcmLoadError::FileTooLarge(max_bytes));
+                    if let Some(file_frames) = file_frames {
+                        if file_frames > max_frames as u64 {
+                            return Err(LoadError::FileTooLarge(max_bytes));
                         }
                     } else {
                         check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
@@ -202,13 +410,14 @@ pub(crate) fn decode_native_bitdepth(
                 AudioBufferRef::U16(d) => {
                     let mut decoded_channels = Vec::<Vec<u16>>::new();
                     for _ in 0..n_channels {
-                        decoded_channels.push(Vec::with_capacity(n_frames.unwrap_or(0) as usize));
+                        decoded_channels
+                            .push(Vec::with_capacity(file_frames.unwrap_or(0) as usize));
                     }
 
                     max_frames = max_bytes / (2 * n_channels);
-                    if let Some(n_frames) = n_frames {
-                        if n_frames > max_frames as u64 {
-                            return Err(PcmLoadError::FileTooLarge(max_bytes));
+                    if let Some(file_frames) = file_frames {
+                        if file_frames > max_frames as u64 {
+                            return Err(LoadError::FileTooLarge(max_bytes));
                         }
                     } else {
                         check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
@@ -222,13 +431,14 @@ pub(crate) fn decode_native_bitdepth(
                 AudioBufferRef::U24(d) => {
                     let mut decoded_channels = Vec::<Vec<[u8; 3]>>::new();
                     for _ in 0..n_channels {
-                        decoded_channels.push(Vec::with_capacity(n_frames.unwrap_or(0) as usize));
+                        decoded_channels
+                            .push(Vec::with_capacity(file_frames.unwrap_or(0) as usize));
                     }
 
                     max_frames = max_bytes / (3 * n_channels);
-                    if let Some(n_frames) = n_frames {
-                        if n_frames > max_frames as u64 {
-                            return Err(PcmLoadError::FileTooLarge(max_bytes));
+                    if let Some(file_frames) = file_frames {
+                        if file_frames > max_frames as u64 {
+                            return Err(LoadError::FileTooLarge(max_bytes));
                         }
                     } else {
                         check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
@@ -242,13 +452,14 @@ pub(crate) fn decode_native_bitdepth(
                 AudioBufferRef::U32(d) => {
                     let mut decoded_channels = Vec::<Vec<f32>>::new();
                     for _ in 0..n_channels {
-                        decoded_channels.push(Vec::with_capacity(n_frames.unwrap_or(0) as usize));
+                        decoded_channels
+                            .push(Vec::with_capacity(file_frames.unwrap_or(0) as usize));
                     }
 
                     max_frames = max_bytes / (4 * n_channels);
-                    if let Some(n_frames) = n_frames {
-                        if n_frames > max_frames as u64 {
-                            return Err(PcmLoadError::FileTooLarge(max_bytes));
+                    if let Some(file_frames) = file_frames {
+                        if file_frames > max_frames as u64 {
+                            return Err(LoadError::FileTooLarge(max_bytes));
                         }
                     } else {
                         check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
@@ -262,13 +473,14 @@ pub(crate) fn decode_native_bitdepth(
                 AudioBufferRef::S8(d) => {
                     let mut decoded_channels = Vec::<Vec<i8>>::new();
                     for _ in 0..n_channels {
-                        decoded_channels.push(Vec::with_capacity(n_frames.unwrap_or(0) as usize));
+                        decoded_channels
+                            .push(Vec::with_capacity(file_frames.unwrap_or(0) as usize));
                     }
 
                     max_frames = max_bytes / n_channels;
-                    if let Some(n_frames) = n_frames {
-                        if n_frames > max_frames as u64 {
-                            return Err(PcmLoadError::FileTooLarge(max_bytes));
+                    if let Some(file_frames) = file_frames {
+                        if file_frames > max_frames as u64 {
+                            return Err(LoadError::FileTooLarge(max_bytes));
                         }
                     } else {
                         check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
@@ -282,13 +494,14 @@ pub(crate) fn decode_native_bitdepth(
                 AudioBufferRef::S16(d) => {
                     let mut decoded_channels = Vec::<Vec<i16>>::new();
                     for _ in 0..n_channels {
-                        decoded_channels.push(Vec::with_capacity(n_frames.unwrap_or(0) as usize));
+                        decoded_channels
+                            .push(Vec::with_capacity(file_frames.unwrap_or(0) as usize));
                     }
 
                     max_frames = max_bytes / (2 * n_channels);
-                    if let Some(n_frames) = n_frames {
-                        if n_frames > max_frames as u64 {
-                            return Err(PcmLoadError::FileTooLarge(max_bytes));
+                    if let Some(file_frames) = file_frames {
+                        if file_frames > max_frames as u64 {
+                            return Err(LoadError::FileTooLarge(max_bytes));
                         }
                     } else {
                         check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
@@ -302,13 +515,14 @@ pub(crate) fn decode_native_bitdepth(
                 AudioBufferRef::S24(d) => {
                     let mut decoded_channels = Vec::<Vec<[u8; 3]>>::new();
                     for _ in 0..n_channels {
-                        decoded_channels.push(Vec::with_capacity(n_frames.unwrap_or(0) as usize));
+                        decoded_channels
+                            .push(Vec::with_capacity(file_frames.unwrap_or(0) as usize));
                     }
 
                     max_frames = max_bytes / (3 * n_channels);
-                    if let Some(n_frames) = n_frames {
-                        if n_frames > max_frames as u64 {
-                            return Err(PcmLoadError::FileTooLarge(max_bytes));
+                    if let Some(file_frames) = file_frames {
+                        if file_frames > max_frames as u64 {
+                            return Err(LoadError::FileTooLarge(max_bytes));
                         }
                     } else {
                         check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
@@ -322,13 +536,14 @@ pub(crate) fn decode_native_bitdepth(
                 AudioBufferRef::S32(d) => {
                     let mut decoded_channels = Vec::<Vec<f32>>::new();
                     for _ in 0..n_channels {
-                        decoded_channels.push(Vec::with_capacity(n_frames.unwrap_or(0) as usize));
+                        decoded_channels
+                            .push(Vec::with_capacity(file_frames.unwrap_or(0) as usize));
                     }
 
                     max_frames = max_bytes / (4 * n_channels);
-                    if let Some(n_frames) = n_frames {
-                        if n_frames > max_frames as u64 {
-                            return Err(PcmLoadError::FileTooLarge(max_bytes));
+                    if let Some(file_frames) = file_frames {
+                        if file_frames > max_frames as u64 {
+                            return Err(LoadError::FileTooLarge(max_bytes));
                         }
                     } else {
                         check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
@@ -342,13 +557,14 @@ pub(crate) fn decode_native_bitdepth(
                 AudioBufferRef::F32(d) => {
                     let mut decoded_channels = Vec::<Vec<f32>>::new();
                     for _ in 0..n_channels {
-                        decoded_channels.push(Vec::with_capacity(n_frames.unwrap_or(0) as usize));
+                        decoded_channels
+                            .push(Vec::with_capacity(file_frames.unwrap_or(0) as usize));
                     }
 
                     max_frames = max_bytes / (4 * n_channels);
-                    if let Some(n_frames) = n_frames {
-                        if n_frames > max_frames as u64 {
-                            return Err(PcmLoadError::FileTooLarge(max_bytes));
+                    if let Some(file_frames) = file_frames {
+                        if file_frames > max_frames as u64 {
+                            return Err(LoadError::FileTooLarge(max_bytes));
                         }
                     } else {
                         check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
@@ -362,13 +578,14 @@ pub(crate) fn decode_native_bitdepth(
                 AudioBufferRef::F64(d) => {
                     let mut decoded_channels = Vec::<Vec<f64>>::new();
                     for _ in 0..n_channels {
-                        decoded_channels.push(Vec::with_capacity(n_frames.unwrap_or(0) as usize));
+                        decoded_channels
+                            .push(Vec::with_capacity(file_frames.unwrap_or(0) as usize));
                     }
 
                     max_frames = max_bytes / (8 * n_channels);
-                    if let Some(n_frames) = n_frames {
-                        if n_frames > max_frames as u64 {
-                            return Err(PcmLoadError::FileTooLarge(max_bytes));
+                    if let Some(file_frames) = file_frames {
+                        if file_frames > max_frames as u64 {
+                            return Err(LoadError::FileTooLarge(max_bytes));
                         }
                     } else {
                         check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
@@ -385,18 +602,18 @@ pub(crate) fn decode_native_bitdepth(
                 // packet as usual.
                 log::warn!("Symphonia decode warning: {}", err);
             }
-            Err(e) => return Err(PcmLoadError::ErrorWhileDecoding(e)),
+            Err(e) => return Err(LoadError::ErrorWhileDecoding(e)),
         };
     }
 
     if first_packet.is_none() {
-        return Err(PcmLoadError::UnexpectedErrorWhileDecoding(
+        return Err(LoadError::UnexpectedErrorWhileDecoding(
             "no packet was found".into(),
         ));
     }
 
-    let unexpected_format = |expected: &str| -> PcmLoadError {
-        PcmLoadError::UnexpectedErrorWhileDecoding(
+    let unexpected_format = |expected: &str| -> LoadError {
+        LoadError::UnexpectedErrorWhileDecoding(
             format!(
                 "Symphonia returned a packet that was not the expected format of {}",
                 expected
@@ -422,7 +639,7 @@ pub(crate) fn decode_native_bitdepth(
                 match decoder.decode(&packet) {
                     Ok(decoded) => match decoded {
                         AudioBufferRef::U8(d) => {
-                            if n_frames.is_none() {
+                            if file_frames.is_none() {
                                 check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
                             }
 
@@ -431,11 +648,13 @@ pub(crate) fn decode_native_bitdepth(
                         _ => return Err(unexpected_format("u8")),
                     },
                     Err(symphonia::core::errors::Error::DecodeError(err)) => decode_warning(err),
-                    Err(e) => return Err(PcmLoadError::ErrorWhileDecoding(e)),
+                    Err(e) => return Err(LoadError::ErrorWhileDecoding(e)),
                 }
             }
 
-            PcmRAMType::U8(decoded_channels)
+            shrink_buffer(&mut decoded_channels);
+
+            DecodedAudioType::U8(decoded_channels)
         }
         FirstPacketType::U16(mut decoded_channels) => {
             while let Ok(packet) = probed.format.next_packet() {
@@ -447,7 +666,7 @@ pub(crate) fn decode_native_bitdepth(
                 match decoder.decode(&packet) {
                     Ok(decoded) => match decoded {
                         AudioBufferRef::U16(d) => {
-                            if n_frames.is_none() {
+                            if file_frames.is_none() {
                                 check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
                             }
 
@@ -456,11 +675,13 @@ pub(crate) fn decode_native_bitdepth(
                         _ => return Err(unexpected_format("u16")),
                     },
                     Err(symphonia::core::errors::Error::DecodeError(err)) => decode_warning(err),
-                    Err(e) => return Err(PcmLoadError::ErrorWhileDecoding(e)),
+                    Err(e) => return Err(LoadError::ErrorWhileDecoding(e)),
                 }
             }
 
-            PcmRAMType::U16(decoded_channels)
+            shrink_buffer(&mut decoded_channels);
+
+            DecodedAudioType::U16(decoded_channels)
         }
         FirstPacketType::U24(mut decoded_channels) => {
             while let Ok(packet) = probed.format.next_packet() {
@@ -472,7 +693,7 @@ pub(crate) fn decode_native_bitdepth(
                 match decoder.decode(&packet) {
                     Ok(decoded) => match decoded {
                         AudioBufferRef::U24(d) => {
-                            if n_frames.is_none() {
+                            if file_frames.is_none() {
                                 check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
                             }
 
@@ -481,11 +702,13 @@ pub(crate) fn decode_native_bitdepth(
                         _ => return Err(unexpected_format("u24")),
                     },
                     Err(symphonia::core::errors::Error::DecodeError(err)) => decode_warning(err),
-                    Err(e) => return Err(PcmLoadError::ErrorWhileDecoding(e)),
+                    Err(e) => return Err(LoadError::ErrorWhileDecoding(e)),
                 }
             }
 
-            PcmRAMType::U24(decoded_channels)
+            shrink_buffer(&mut decoded_channels);
+
+            DecodedAudioType::U24(decoded_channels)
         }
         FirstPacketType::U32(mut decoded_channels) => {
             while let Ok(packet) = probed.format.next_packet() {
@@ -497,7 +720,7 @@ pub(crate) fn decode_native_bitdepth(
                 match decoder.decode(&packet) {
                     Ok(decoded) => match decoded {
                         AudioBufferRef::U32(d) => {
-                            if n_frames.is_none() {
+                            if file_frames.is_none() {
                                 check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
                             }
 
@@ -506,11 +729,13 @@ pub(crate) fn decode_native_bitdepth(
                         _ => return Err(unexpected_format("u32")),
                     },
                     Err(symphonia::core::errors::Error::DecodeError(err)) => decode_warning(err),
-                    Err(e) => return Err(PcmLoadError::ErrorWhileDecoding(e)),
+                    Err(e) => return Err(LoadError::ErrorWhileDecoding(e)),
                 }
             }
 
-            PcmRAMType::F32(decoded_channels)
+            shrink_buffer(&mut decoded_channels);
+
+            DecodedAudioType::F32(decoded_channels)
         }
         FirstPacketType::S8(mut decoded_channels) => {
             while let Ok(packet) = probed.format.next_packet() {
@@ -522,7 +747,7 @@ pub(crate) fn decode_native_bitdepth(
                 match decoder.decode(&packet) {
                     Ok(decoded) => match decoded {
                         AudioBufferRef::S8(d) => {
-                            if n_frames.is_none() {
+                            if file_frames.is_none() {
                                 check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
                             }
 
@@ -531,11 +756,13 @@ pub(crate) fn decode_native_bitdepth(
                         _ => return Err(unexpected_format("i8")),
                     },
                     Err(symphonia::core::errors::Error::DecodeError(err)) => decode_warning(err),
-                    Err(e) => return Err(PcmLoadError::ErrorWhileDecoding(e)),
+                    Err(e) => return Err(LoadError::ErrorWhileDecoding(e)),
                 }
             }
 
-            PcmRAMType::S8(decoded_channels)
+            shrink_buffer(&mut decoded_channels);
+
+            DecodedAudioType::S8(decoded_channels)
         }
         FirstPacketType::S16(mut decoded_channels) => {
             while let Ok(packet) = probed.format.next_packet() {
@@ -547,7 +774,7 @@ pub(crate) fn decode_native_bitdepth(
                 match decoder.decode(&packet) {
                     Ok(decoded) => match decoded {
                         AudioBufferRef::S16(d) => {
-                            if n_frames.is_none() {
+                            if file_frames.is_none() {
                                 check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
                             }
 
@@ -556,11 +783,13 @@ pub(crate) fn decode_native_bitdepth(
                         _ => return Err(unexpected_format("i16")),
                     },
                     Err(symphonia::core::errors::Error::DecodeError(err)) => decode_warning(err),
-                    Err(e) => return Err(PcmLoadError::ErrorWhileDecoding(e)),
+                    Err(e) => return Err(LoadError::ErrorWhileDecoding(e)),
                 }
             }
 
-            PcmRAMType::S16(decoded_channels)
+            shrink_buffer(&mut decoded_channels);
+
+            DecodedAudioType::S16(decoded_channels)
         }
         FirstPacketType::S24(mut decoded_channels) => {
             while let Ok(packet) = probed.format.next_packet() {
@@ -572,7 +801,7 @@ pub(crate) fn decode_native_bitdepth(
                 match decoder.decode(&packet) {
                     Ok(decoded) => match decoded {
                         AudioBufferRef::S24(d) => {
-                            if n_frames.is_none() {
+                            if file_frames.is_none() {
                                 check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
                             }
 
@@ -581,11 +810,13 @@ pub(crate) fn decode_native_bitdepth(
                         _ => return Err(unexpected_format("i24")),
                     },
                     Err(symphonia::core::errors::Error::DecodeError(err)) => decode_warning(err),
-                    Err(e) => return Err(PcmLoadError::ErrorWhileDecoding(e)),
+                    Err(e) => return Err(LoadError::ErrorWhileDecoding(e)),
                 }
             }
 
-            PcmRAMType::S24(decoded_channels)
+            shrink_buffer(&mut decoded_channels);
+
+            DecodedAudioType::S24(decoded_channels)
         }
         FirstPacketType::S32(mut decoded_channels) => {
             while let Ok(packet) = probed.format.next_packet() {
@@ -597,7 +828,7 @@ pub(crate) fn decode_native_bitdepth(
                 match decoder.decode(&packet) {
                     Ok(decoded) => match decoded {
                         AudioBufferRef::S32(d) => {
-                            if n_frames.is_none() {
+                            if file_frames.is_none() {
                                 check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
                             }
 
@@ -606,11 +837,13 @@ pub(crate) fn decode_native_bitdepth(
                         _ => return Err(unexpected_format("i32")),
                     },
                     Err(symphonia::core::errors::Error::DecodeError(err)) => decode_warning(err),
-                    Err(e) => return Err(PcmLoadError::ErrorWhileDecoding(e)),
+                    Err(e) => return Err(LoadError::ErrorWhileDecoding(e)),
                 }
             }
 
-            PcmRAMType::F32(decoded_channels)
+            shrink_buffer(&mut decoded_channels);
+
+            DecodedAudioType::F32(decoded_channels)
         }
         FirstPacketType::F32(mut decoded_channels) => {
             while let Ok(packet) = probed.format.next_packet() {
@@ -622,7 +855,7 @@ pub(crate) fn decode_native_bitdepth(
                 match decoder.decode(&packet) {
                     Ok(decoded) => match decoded {
                         AudioBufferRef::F32(d) => {
-                            if n_frames.is_none() {
+                            if file_frames.is_none() {
                                 check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
                             }
 
@@ -631,11 +864,13 @@ pub(crate) fn decode_native_bitdepth(
                         _ => return Err(unexpected_format("f32")),
                     },
                     Err(symphonia::core::errors::Error::DecodeError(err)) => decode_warning(err),
-                    Err(e) => return Err(PcmLoadError::ErrorWhileDecoding(e)),
+                    Err(e) => return Err(LoadError::ErrorWhileDecoding(e)),
                 }
             }
 
-            PcmRAMType::F32(decoded_channels)
+            shrink_buffer(&mut decoded_channels);
+
+            DecodedAudioType::F32(decoded_channels)
         }
         FirstPacketType::F64(mut decoded_channels) => {
             while let Ok(packet) = probed.format.next_packet() {
@@ -647,7 +882,7 @@ pub(crate) fn decode_native_bitdepth(
                 match decoder.decode(&packet) {
                     Ok(decoded) => match decoded {
                         AudioBufferRef::F64(d) => {
-                            if n_frames.is_none() {
+                            if file_frames.is_none() {
                                 check_total_frames(&mut total_frames, max_frames, d.chan(0).len())?;
                             }
 
@@ -656,15 +891,27 @@ pub(crate) fn decode_native_bitdepth(
                         _ => return Err(unexpected_format("f64")),
                     },
                     Err(symphonia::core::errors::Error::DecodeError(err)) => decode_warning(err),
-                    Err(e) => return Err(PcmLoadError::ErrorWhileDecoding(e)),
+                    Err(e) => return Err(LoadError::ErrorWhileDecoding(e)),
                 }
             }
 
-            PcmRAMType::F64(decoded_channels)
+            shrink_buffer(&mut decoded_channels);
+
+            DecodedAudioType::F64(decoded_channels)
         }
     };
 
-    Ok(PcmRAM::new(pcm_type, sample_rate))
+    Ok(DecodedAudio::new(pcm_type, sample_rate))
+}
+
+fn shrink_buffer<T>(channels: &mut [Vec<T>]) {
+    for ch in channels.iter_mut() {
+        // If the allocated capacity is significantly greater than the
+        // length, shrink it to save memory.
+        if ch.capacity() > ch.len() + SHRINK_THRESHOLD {
+            ch.shrink_to_fit();
+        }
+    }
 }
 
 #[inline]
